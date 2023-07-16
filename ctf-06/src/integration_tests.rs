@@ -2,7 +2,7 @@
 pub mod tests {
     use crate::msg::{Cw20HookMsg, ExecuteMsg, QueryMsg};
     use crate::state::Config;
-    use cosmwasm_std::{attr, to_binary, Addr, Empty, Uint128};
+    use cosmwasm_std::{attr, to_binary, Addr, Empty, Uint128, Binary};
     use cw20::{Cw20ExecuteMsg, MinterResponse};
     use cw_multi_test::{App, Contract, ContractWrapper, Executor};
 
