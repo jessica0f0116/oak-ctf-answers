@@ -450,13 +450,13 @@ Here's some napkin math:
 
 4) next user mints shares for 2000 assets, shares = 2000 * 1 / 1001 = 1 share
 
-5)total_supply is now 2, total assets is 3001
+5) total_supply is now 2, total assets is 3001
 
-6)exchange rate is now (shares = asset * 2 / 3001) or (asset = shares * 3001 / 2)
+6) exchange rate is now (shares = asset * 2 / 3001) or (asset = shares * 3001 / 2)
 
-7)now we burn the share, at the expense of the last user
+7) now we burn the share, at the expense of the last user
 
-8)our initial one share is now worth 1500. we deposited 1 and donated 1000, so our profit is (1500 - 1000 + 1) = 499
+8) our initial one share is now worth 1500. we deposited 1 and donated 1000, so our profit is (1500 - 1000 + 1) = 499
 
 -the profit scales up for each additional deposit
 
