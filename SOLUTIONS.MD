@@ -1443,7 +1443,7 @@ pub fn mint(deps: DepsMut, _env: Env, info: MessageInfo) -> Result<Response, Con
                 .query_wasm_smart(contract_addr.clone(), &QueryMsg::Config {})
                 .unwrap();
 
-            // mint to whitelisted user until max limit
+            // exceed max limit
             assert_eq!(config.mint_per_user, 3);
 
             let token_id = config.total_tokens;
@@ -1474,6 +1474,7 @@ pub fn mint(deps: DepsMut, _env: Env, info: MessageInfo) -> Result<Response, Con
             .query_wasm_smart(contract_addr, &QueryMsg::Config {})
             .unwrap();
 
+        // now lots have been minted
         assert_eq!(config.total_tokens, 50);
     }
 ```
