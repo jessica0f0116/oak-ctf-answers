@@ -400,6 +400,9 @@ many vault implementations.
 
 We can look at how the shares are calculated to see why, in mint() under src/contract.rs L58:
 ```rust
+    let total_assets = contract_balance.amount;
+    let total_supply = config.total_supply;
+
     // share = asset * total supply / total assets
     let mint_amount = if total_supply.is_zero() {
         amount
