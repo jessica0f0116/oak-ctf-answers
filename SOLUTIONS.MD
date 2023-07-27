@@ -1226,7 +1226,18 @@ them after, and then you will be able to claim an increased rewards amount.
 
 ### Recommendation
 
-Verify the token address so they can't just pass in a fake one.
+Verify the token address so they can't just pass in a fake one?
+Update the user_index in all cases, so that users aren't able to claim rewards from previous staking periods
+(+by extension a larger share of the current staking)
+```rust
+pub fn update_rewards(user: &mut UserRewardInfo, state: &State) {
+    // calculate pending rewards
+    let reward = (state.global_index - user.user_index) * user.staked_amount;
+    user.pending_rewards += reward;
+
+    user.user_index = state.global_index;
+}
+```
 
 ### Proof of concept
 
