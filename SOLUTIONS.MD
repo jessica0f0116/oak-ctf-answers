@@ -1230,6 +1230,8 @@ Verify the token address so they can't just pass in a fake one.
 
 ### Proof of concept
 
+Disregard lol
+
 ```rust
     #[test]
     fn exploit() {
