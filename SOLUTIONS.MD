@@ -1195,6 +1195,9 @@ before the transfer logic.
 
 ### Description
 
+Actually, I think I completely missed that the token addresss is also not checked. This one and 6 I didn't quite understand the scenario.
+
+
 update_rewards() in contract.rs doesn't actually update the user_index in some cases!
 ```rust
     // no need update amount if zero
@@ -1217,23 +1220,13 @@ You can see here in deposit() in contract.rs that the staked_amount and total_st
     // increase total staked amount
     state.total_staked += amount;
 ```
-If a previous user's staked_amount has decreased to 0, then deposit() will use the old index.
+If the user's staked_amount has decreased to 0, then deposit() will use the old index.
 Just simply sandwich an increase_reward() call, by withdrawing all your funds before, then depositing
 them after, and then you will be able to claim an increased rewards amount.
 
 ### Recommendation
 
-Update the user_index in all cases, so that users aren't able to claim rewards from previous staking periods
-(+by extension a larger share of the current staking)
-```rust
-pub fn update_rewards(user: &mut UserRewardInfo, state: &State) {
-    // calculate pending rewards
-    let reward = (state.global_index - user.user_index) * user.staked_amount;
-    user.pending_rewards += reward;
-
-    user.user_index = state.global_index;
-}
-```
+Verify the token address so they can't just pass in a fake one.
 
 ### Proof of concept
 
