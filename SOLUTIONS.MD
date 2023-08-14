@@ -1195,8 +1195,6 @@ before the transfer logic.
 
 ### Description
 
-Actually, I think I completely missed that the token addresss is also not checked. This one and 6 I didn't quite understand the scenario.
-
 
 update_rewards() in contract.rs doesn't actually update the user_index in some cases!
 ```rust
@@ -1240,8 +1238,6 @@ pub fn update_rewards(user: &mut UserRewardInfo, state: &State) {
 ```
 
 ### Proof of concept
-
-Disregard lol
 
 ```rust
     #[test]
